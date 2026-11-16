@@ -1,0 +1,38 @@
+// Ships the logs of this stack's containers to Loki.
+// Only containers of the "aiops" compose project are read; the Circaso containers on this host are left alone.
+
+discovery.docker "aiops" {
+  host = "tcp://docker-socket-proxy:2375"
+
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=aiops"]
+  }
+}
+
+discovery.relabel "aiops" {
+  targets = discovery.docker.aiops.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "aiops" {
+  host       = "tcp://docker-socket-proxy:2375"
+  targets    = discovery.relabel.aiops.output
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

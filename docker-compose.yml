@@ -1,0 +1,180 @@
+# AIOps demo stack. Runs beside the Circaso stack on the same host as its own compose project.
+# Nothing here publishes a host port: the only way in is the existing Circaso Nginx (port 443, Cloudflare only),
+# which forwards aiops.circaso.com to the `nginx` service below over the shared `edge` network.
+name: aiops
+
+x-defaults: &defaults
+  restart: unless-stopped
+  networks: [aiops]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  # The monitored app. No automatic restart: in Act 1 the AI agent is what brings it back.
+  demo-app:
+    <<: *defaults
+    build: ./demo-app
+    image: ${DEMO_APP_IMAGE:-aiops/demo-app:local}
+    container_name: demo-app
+    restart: "no"
+    environment:
+      CHAOS_TOKEN: ${CHAOS_TOKEN:?set CHAOS_TOKEN in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+    volumes:
+      - demo-app-data:/data
+    mem_limit: 512m
+    cpus: 1.0
+
+  nginx:
+    <<: *defaults
+    image: nginx:1-alpine
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/down.html:/usr/share/nginx/html/down.html:ro
+    networks:
+      aiops:
+      edge:
+        aliases: [aiops-nginx]
+    mem_limit: 128m
+
+  nginx-exporter:
+    <<: *defaults
+    image: nginx/nginx-prometheus-exporter:1.5.3
+    command: ["--nginx.scrape-uri=http://nginx:8080/stub_status"]
+    mem_limit: 64m
+
+  # Steady background traffic, so rates and anomaly bands have a baseline.
+  loadgen:
+    <<: *defaults
+    image: curlimages/curl:latest
+    entrypoint: ["/bin/sh", "/loadgen.sh"]
+    volumes:
+      - ./config/loadgen/loadgen.sh:/loadgen.sh:ro
+    mem_limit: 64m
+
+  prometheus:
+    <<: *defaults
+    image: prom/prometheus:v3.16.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./config/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    mem_limit: 768m
+
+  alertmanager:
+    <<: *defaults
+    image: prom/alertmanager:v0.35.0
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./config/alertmanager:/etc/alertmanager:ro
+      - alertmanager-data:/alertmanager
+    mem_limit: 128m
+
+  grafana:
+    <<: *defaults
+    image: grafana/grafana:13.3.1
+    environment:
+      GF_SERVER_ROOT_URL: https://${DOMAIN:?set DOMAIN in .env}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/overview.json
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    mem_limit: 512m
+
+  loki:
+    <<: *defaults
+    image: grafana/loki:3.7.10
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./config/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+    mem_limit: 768m
+
+  # Ships container logs to Loki. Reads them through the socket proxy, never the socket itself.
+  alloy:
+    <<: *defaults
+    image: grafana/alloy:v1.22.0
+    command: ["run", "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./config/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on: [docker-socket-proxy, loki]
+    mem_limit: 256m
+
+  # The ONLY service that mounts the Docker socket. Read-only API sections; every write is refused.
+  docker-socket-proxy:
+    <<: *defaults
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    environment:
+      CONTAINERS: 1
+      NETWORKS: 1
+      INFO: 1
+      IMAGES: 1
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    mem_limit: 64m
+
+  cadvisor:
+    <<: *defaults
+    image: ghcr.io/google/cadvisor:v0.60.6
+    command:
+      - --docker=tcp://docker-socket-proxy:2375
+      - --docker_only=true
+      - --housekeeping_interval=10s
+      - --store_container_labels=false
+      - --whitelisted_container_labels=com.docker.compose.project,com.docker.compose.service
+      - --disable_metrics=percpu,sched,tcp,udp,disk,diskIO,hugetlb,referenced_memory,resctrl,cpuset,advtcp,memory_numa
+    privileged: true
+    security_opt: []
+    devices: ["/dev/kmsg"]
+    volumes:
+      - /:/rootfs:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      # Docker on this host stores containers in containerd, and cAdvisor needs it to learn container names.
+      # Metrics only: nothing the AI can call goes through cAdvisor.
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+    depends_on: [docker-socket-proxy]
+    mem_limit: 256m
+
+  node-exporter:
+    <<: *defaults
+    image: prom/node-exporter:v1.12.1
+    command: ["--path.rootfs=/host"]
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    mem_limit: 64m
+
+networks:
+  aiops:
+    name: aiops
+  # The Circaso Nginx lives on this network; joining it is how aiops.circaso.com reaches us.
+  edge:
+    name: circaso-backend
+    external: true
+
+volumes:
+  demo-app-data:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+  loki-data:
+  alloy-data:

@@ -2,3 +2,6 @@
 .env.*
 !.env.example
 .DS_Store
+
+# Private planning notes: kept locally, never committed
+*Implementation Brief*.md

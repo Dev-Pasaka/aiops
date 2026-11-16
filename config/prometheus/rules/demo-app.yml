@@ -1,0 +1,107 @@
+# Recording rules and alerts for Demo Bank.
+# "Banking requests" excludes the operational endpoints (health, metrics, chaos), which chaos never touches.
+groups:
+  - name: demo-app-recording
+    interval: 10s
+    rules:
+      - record: demo:request_rate
+        expr: sum(rate(http_requests_total{job="demo-app", route!~"/api/(health|metrics|chaos)"}[1m]))
+      - record: demo:error_ratio
+        expr: |
+          sum(rate(http_requests_total{job="demo-app", route!~"/api/(health|metrics|chaos)", status=~"5.."}[2m]))
+            /
+          sum(rate(http_requests_total{job="demo-app", route!~"/api/(health|metrics|chaos)"}[2m]))
+      - record: demo:latency_p95_seconds
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket{job="demo-app", route!~"/api/(health|metrics|chaos)"}[2m])))
+
+      # The "ML baseline": the last hour's average plus or minus three standard deviations.
+      - record: demo:request_rate:avg_1h
+        expr: avg_over_time(demo:request_rate[1h])
+      - record: demo:request_rate:stddev_1h
+        expr: stddev_over_time(demo:request_rate[1h])
+      - record: demo:request_rate:upper
+        expr: demo:request_rate:avg_1h + 3 * demo:request_rate:stddev_1h
+      - record: demo:request_rate:lower
+        expr: clamp_min(demo:request_rate:avg_1h - 3 * demo:request_rate:stddev_1h, 0)
+
+      - record: demo:latency_p95_seconds:avg_1h
+        expr: avg_over_time(demo:latency_p95_seconds[1h])
+      - record: demo:latency_p95_seconds:stddev_1h
+        expr: stddev_over_time(demo:latency_p95_seconds[1h])
+      - record: demo:latency_p95_seconds:upper
+        expr: demo:latency_p95_seconds:avg_1h + 3 * demo:latency_p95_seconds:stddev_1h
+      - record: demo:latency_p95_seconds:lower
+        expr: clamp_min(demo:latency_p95_seconds:avg_1h - 3 * demo:latency_p95_seconds:stddev_1h, 0)
+
+  - name: demo-app-alerts
+    rules:
+      - alert: ServiceDown
+        expr: up{job="demo-app"} == 0
+        for: 30s
+        labels: { severity: critical, service: demo-app, container: demo-app }
+        annotations:
+          summary: Demo Bank is down
+          description: Prometheus has not been able to reach demo-app for 30 seconds.
+
+      - alert: HighErrorRate
+        expr: demo:error_ratio > 0.05
+        for: 1m
+        labels: { severity: critical, service: demo-app, container: demo-app }
+        annotations:
+          summary: Demo Bank is returning errors
+          description: '{{ $value | humanizePercentage }} of banking requests failed with a 5xx over the last 2 minutes.'
+
+      - alert: HighLatency
+        expr: demo:latency_p95_seconds > 1
+        for: 1m
+        labels: { severity: warning, service: demo-app, container: demo-app }
+        annotations:
+          summary: Demo Bank is slow
+          description: 95% of banking requests take up to {{ $value | humanizeDuration }} (threshold 1s).
+
+      - alert: TransfersFailing
+        expr: |
+          sum(rate(bank_transfers_total{job="demo-app", result="failed"}[2m]))
+            /
+          sum(rate(bank_transfers_total{job="demo-app"}[2m])) > 0.1
+        for: 1m
+        labels: { severity: critical, service: demo-app, container: demo-app }
+        annotations:
+          summary: Money transfers are failing
+          description: '{{ $value | humanizePercentage }} of transfers failed over the last 2 minutes while the rest of the app responds.'
+
+      - alert: MemoryNearLimit
+        expr: |
+          container_memory_working_set_bytes{container="demo-app"}
+            / (container_spec_memory_limit_bytes{container="demo-app"} > 0) > 0.85
+        for: 30s
+        labels: { severity: warning, service: demo-app, container: demo-app }
+        annotations:
+          summary: Demo Bank is close to its memory limit
+          description: demo-app is using {{ $value | humanizePercentage }} of its memory limit and will be killed if it reaches it.
+
+      # Anomaly band: the value has left avg ± 3 standard deviations of the last hour.
+      # The band never gets narrower than 10% of the average, so a perfectly flat baseline does not flag tiny wobbles.
+      - alert: RequestRateAnomaly
+        expr: |
+          abs(demo:request_rate - demo:request_rate:avg_1h)
+            > 3 * ((demo:request_rate:stddev_1h >= 0.1 * demo:request_rate:avg_1h) or 0.1 * demo:request_rate:avg_1h)
+          and count_over_time(demo:request_rate[1h]) > 60
+        for: 2m
+        labels: { severity: warning, service: demo-app, container: demo-app }
+        annotations:
+          summary: Unusual request rate on Demo Bank
+          description: Request rate is {{ $value | humanize }} req/s away from the last hour's average, outside the 3-sigma band.
+
+      - alert: LatencyAnomaly
+        expr: |
+          (demo:latency_p95_seconds - demo:latency_p95_seconds:avg_1h)
+            > 3 * clamp_min(demo:latency_p95_seconds:stddev_1h, 0.05)
+          and count_over_time(demo:latency_p95_seconds[1h]) > 60
+        for: 2m
+        labels: { severity: warning, service: demo-app, container: demo-app }
+        annotations:
+          summary: Unusual latency on Demo Bank
+          description: p95 latency is {{ $value | humanizeDuration }} above the last hour's average, outside the 3-sigma band.

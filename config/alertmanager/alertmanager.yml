@@ -1,0 +1,11 @@
+# Alerts are grouped per alert and service. The receiver has no target yet:
+# HolmesGPT is wired in here in the next step, and resolved notifications are already on.
+route:
+  receiver: default
+  group_by: [alertname, service]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+
+receivers:
+  - name: default
